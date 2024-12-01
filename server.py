@@ -1,4 +1,3 @@
-from email.utils import parsedate_to_datetime
 import socket
 import struct
 import threading
@@ -6,6 +5,8 @@ import logging
 import random
 import os
 from collections import namedtuple
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 
 # Define the Header namedtuple matching the client's
 Header = namedtuple('Header', ['version', 'type', 'window', 'seq_num', 'ack_num', 'checksum'])
@@ -55,7 +56,9 @@ class ReliableServer:
                 self.client_states[client_address] = {
                     'expected_seq_num': 0,
                     'connected': False,
-                    'rwnd': 65535  # Receiver window size
+                    'rwnd': 65535,  # Receiver window size
+                    'receive_buffer': {},
+                    'last_ack_sent': 0
                 }
 
             client_state = self.client_states[client_address]
@@ -105,7 +108,11 @@ class ReliableServer:
                 logging.warning(f"Unexpected ACK during connection setup from {client_address}")
         else:
             # Data transfer phase
-            logging.info(f"Received ACK from {client_address}: {header.ack_num}")
+            logging.info(f"Received ACK from {client_address}: ack_num={header.ack_num}")
+            # Update receiver window size
+            client_state['rwnd'] = header.window
+            # Handle any buffered data that can now be processed
+            self.process_receive_buffer(client_state)
 
     def handle_data(self, data, header, client_address, client_state):
         """Handle DATA packet during data transfer."""
@@ -115,34 +122,60 @@ class ReliableServer:
 
         if seq_num == expected_seq_num:
             # Correct packet received
-            logging.info(f"Received DATA from {client_address}: seq_num={seq_num}")
+            logging.info(f"Received DATA from {client_address}: seq_num={seq_num}, length={len(data_payload)}")
             client_state['expected_seq_num'] += len(data_payload)
             # Process the data (e.g., save to file or handle as HTTP request)
-            request = data_payload.decode('utf-8')
+            request = data_payload.decode('utf-8', errors='replace')
             response_content = self.handle_request(request)
 
-            # Send ACK with updated ack_num
+            # Send ACK with updated ack_num and receiver window size
             ack_pkt = self.create_packet(
                 ACK,
                 seq_num=client_state['server_seq_num'],
-                ack_num=client_state['expected_seq_num']
+                ack_num=client_state['expected_seq_num'],
+                window=client_state['rwnd']
             )
             self.send_with_simulation(ack_pkt, client_address)
-            logging.info(f"Sent ACK to {client_address}: ack_num={client_state['expected_seq_num']}")
+            logging.info(f"Sent ACK to {client_address}: ack_num={client_state['expected_seq_num']}, rwnd={client_state['rwnd']}")
 
             # Send response data back to the client
             if response_content:
                 self.send_response(response_content, client_address, client_state)
-        else:
-            # Out-of-order packet, send duplicate ACK
-            logging.warning(f"Out-of-order DATA from {client_address}: expected_seq_num={expected_seq_num}, received_seq_num={seq_num}")
+        elif seq_num > expected_seq_num:
+            # Future packet, buffer it
+            logging.info(f"Buffered out-of-order packet from {client_address}: seq_num={seq_num}")
+            client_state['receive_buffer'][seq_num] = data_payload
+            # Send duplicate ACK
             ack_pkt = self.create_packet(
                 ACK,
                 seq_num=client_state['server_seq_num'],
-                ack_num=expected_seq_num
+                ack_num=expected_seq_num,
+                window=client_state['rwnd']
             )
             self.send_with_simulation(ack_pkt, client_address)
-            logging.info(f"Sent duplicate ACK to {client_address}: ack_num={expected_seq_num}")
+        else:
+            # Duplicate packet, send ACK again
+            logging.info(f"Received duplicate packet from {client_address}: seq_num={seq_num}")
+            ack_pkt = self.create_packet(
+                ACK,
+                seq_num=client_state['server_seq_num'],
+                ack_num=expected_seq_num,
+                window=client_state['rwnd']
+            )
+            self.send_with_simulation(ack_pkt, client_address)
+
+    def process_receive_buffer(self, client_state):
+        """Process any buffered data that can now be handled."""
+        expected_seq_num = client_state['expected_seq_num']
+        buffer = client_state['receive_buffer']
+
+        while expected_seq_num in buffer:
+            data_payload = buffer.pop(expected_seq_num)
+            expected_seq_num += len(data_payload)
+            # Process the data as needed
+            # For simplicity, we're not processing buffered data in this example
+
+        client_state['expected_seq_num'] = expected_seq_num
 
     def handle_fin(self, header, client_address, client_state):
         """Handle FIN packet for connection termination."""
@@ -155,47 +188,60 @@ class ReliableServer:
         )
         self.send_with_simulation(fin_ack_pkt, client_address)
         logging.info(f"Sent ACK for FIN to {client_address}")
-        # Remove client state
-        del self.client_states[client_address]
-        logging.info(f"Connection closed with {client_address}")
+        # Remove client state after a short delay to ensure ACK is sent
+        threading.Timer(1.0, self.cleanup_client_state, args=(client_address,)).start()
+
+    def cleanup_client_state(self, client_address):
+        """Clean up client state."""
+        if client_address in self.client_states:
+            del self.client_states[client_address]
+            logging.info(f"Connection closed with {client_address}")
 
     def send_response(self, response, client_address, client_state):
         """Send response data to the client using the custom protocol."""
-        # Split response into segments
-        segments = [response[i:i+1400] for i in range(0, len(response), 1400)]
+        # Split response into segments based on the receiver's window size
+        max_segment_size = min(1400, client_state['rwnd'])
+        segments = [response[i:i+max_segment_size] for i in range(0, len(response), max_segment_size)]
         seq_num = client_state['server_seq_num']
+        ack_num = client_state['expected_seq_num']
 
         for segment in segments:
             data_pkt = self.create_packet(
                 DATA,
                 seq_num=seq_num,
-                ack_num=client_state['expected_seq_num'],
-                data=segment.encode('utf-8')
+                ack_num=ack_num,
+                data=segment.encode('utf-8', errors='replace'),
+                window=client_state['rwnd']
             )
             self.send_with_simulation(data_pkt, client_address)
-            logging.info(f"Sent DATA to {client_address}: seq_num={seq_num}")
+            logging.info(f"Sent DATA to {client_address}: seq_num={seq_num}, length={len(segment)}")
             seq_num += len(segment)
+            # Update server sequence number
+            client_state['server_seq_num'] = seq_num
+            # Adjust receiver window size (for simulation purposes)
+            client_state['rwnd'] -= len(segment)
+            if client_state['rwnd'] <= 0:
+                client_state['rwnd'] = 0
 
-        # Update server sequence number
-        client_state['server_seq_num'] = seq_num
+            # For simplicity, we're not implementing retransmission timers on the server
 
         # Send FIN packet to signal end of data
         fin_pkt = self.create_packet(
             FIN,
             seq_num=client_state['server_seq_num'],
-            ack_num=client_state['expected_seq_num']
+            ack_num=ack_num
         )
         self.send_with_simulation(fin_pkt, client_address)
         logging.info(f"Sent FIN to {client_address}")
 
-    def create_packet(self, type, seq_num=0, ack_num=0, data=b''):
+    def create_packet(self, type, seq_num=0, ack_num=0, data=b'', window=65535):
         """Create a packet with the given parameters."""
         header = Header(
             version=1,
             type=type,
-            window=65535,  # Server's receive window size
-            seq_num=seq_num,
-            ack_num=ack_num,
+            window=window,  # Server's receive window size
+            seq_num=seq_num % (2**32),
+            ack_num=ack_num % (2**32),
             checksum=0
         )
         header_bytes = struct.pack('!BBHLLH', *header)
@@ -207,12 +253,19 @@ class ReliableServer:
         packet = packet[:12] + struct.pack('!H', checksum) + packet[14:]
         return packet
 
-    def calculate_checksum(self, packet):
-        """Calculate checksum for the given packet."""
-        # Zero out checksum field for calculation
-        packet_zero_checksum = packet[:12] + b'\x00\x00' + packet[14:]
-        checksum = sum(packet_zero_checksum) & 0xFFFF
-        return checksum
+    def calculate_checksum(self, data):
+        """Compute checksum of the given data using one's complement."""
+        # Ensure even number of bytes
+        if len(data) % 2 != 0:
+            data += b'\x00'  # Padding
+
+        checksum = 0
+        for i in range(0, len(data), 2):
+            word = (data[i] << 8) + data[i + 1]
+            checksum += word
+            # Carry around addition
+            checksum = (checksum & 0xFFFF) + (checksum >> 16)
+        return ~checksum & 0xFFFF  # One's complement
 
     def parse_header(self, packet):
         """Parse the header of the received packet."""
@@ -221,7 +274,8 @@ class ReliableServer:
         header = Header._make(struct.unpack('!BBHLLH', packet[:14]))
         # Verify checksum
         received_checksum = header.checksum
-        calculated_checksum = self.calculate_checksum(packet)
+        packet_zero_checksum = packet[:12] + b'\x00\x00' + packet[14:]
+        calculated_checksum = self.calculate_checksum(packet_zero_checksum)
         if received_checksum != calculated_checksum:
             raise ValueError("Checksum mismatch")
         return header
@@ -244,11 +298,11 @@ class ReliableServer:
                 return HTTP_RESPONSES[400]
 
             method, path, protocol = request_line
-            if not path or not len(path): 
+            if not path or not len(path):
                 return HTTP_RESPONSES[400]
-            
+
             path = path.lstrip("/")
-            if path != "test.html": 
+            if path != "test.html":
                 logging.info(HTTP_RESPONSES[404])
                 return HTTP_RESPONSES[404]
 
@@ -270,7 +324,7 @@ class ReliableServer:
                     if if_modified_since:
                         ims_timestamp = parse_http_date(if_modified_since)
                         last_modified_timestamp = parse_http_date(LAST_MODIFIED)
-                        
+
                         if ims_timestamp and last_modified_timestamp:
                             if ims_timestamp >= last_modified_timestamp:
                                 logging.info("304 Not Modified: Resource not modified since " + if_modified_since)
@@ -283,7 +337,7 @@ class ReliableServer:
                     return HTTP_RESPONSES[404]
             else:
                 return HTTP_RESPONSES[400]
-        
+
         except Exception as e:
             logging.error(f"Error handling request: {e}")
             return HTTP_RESPONSES[400]
@@ -293,12 +347,12 @@ def parse_http_date(date_string):
     if date_string:
         try:
             return parsedate_to_datetime(date_string).timestamp()
-        except ValueError:
+        except (ValueError, TypeError):
             logging.error(f"Invalid date format: {date_string}")
     return None
 
 # HTTP response templates
-LAST_MODIFIED = "Sat, 21 Oct 2024 00:00:00 GMT"
+LAST_MODIFIED = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 HTTP_RESPONSES = {
     200: "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nLast-Modified: {}\r\n\r\n",

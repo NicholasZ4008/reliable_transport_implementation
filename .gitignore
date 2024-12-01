@@ -1,0 +1,6 @@
+# Ignore specific log files
+client_protocol.log
+server_protocol.log
+
+# Ignore the Wireshark capture folder
+wireshark_capture/
